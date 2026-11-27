@@ -5,214 +5,645 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-
-env:
-  REGISTRY: docker.io
-  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  workflow_dispatch:
 
 permissions:
   contents: read
-  security-events: write
-  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  REGISTRY: docker.io
+  IMAGE_PREFIX: music-store
+  NODE_VERSION: "22"
+  JAVA_VERSION: "21"
+  PYTHON_VERSION: "3.11"
+  RUBY_VERSION: "3.3"
+  DOTNET_VERSION: "8.0.x"
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
+
+  # ============================================================
+  # 1. MICROSERVICE DISCOVERY
+  # ============================================================
+
   discover:
+    name: Discover Microservices
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+
     steps:
-      - uses: actions/checkout@v4
-      - id: matrix
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Generate Service Matrix
+        id: matrix
         run: |
-          services=$(ls -1 services | jq -R -s -c 'split("\n") | map(select(. != ""))')
-          echo "matrix={\"service\":$services}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          services=$(find services \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -exec test -f '{}/Dockerfile' \; \
+            -printf '%f\n' | sort | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          if [[ "$services" == "[]" ]]; then
+            echo "::error::No microservices discovered"
+            exit 1
+          fi
+
+          matrix=$(jq -cn \
+            --argjson services "$services" \
+            '{service: $services}')
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+          echo "### Discovered Microservices" >> "$GITHUB_STEP_SUMMARY"
+          echo "$services" | jq -r '.[] | "- " + .' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 2. BUILD AND TEST MATRIX
+  # ============================================================
 
   validate:
+    name: Build & Test - ${{ matrix.service }}
     needs: discover
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     strategy:
       fail-fast: false
       max-parallel: 4
-      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Node
-        if: matrix.service == 'frontend' || matrix.service == 'cart-service' || matrix.service == 'api-gateway' || matrix.service == 'load-generator'
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Node.js Services
+
+      - name: Setup Node.js
+        if: |
+          contains(
+            fromJSON('["frontend","cart-service","api-gateway","load-generator"]'),
+            matrix.service
+          )
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+
+      # Java Service
+
       - name: Setup Java
         if: matrix.service == 'catalog-service'
         uses: actions/setup-java@v4
         with:
-          java-version: 21
+          java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
           cache: maven
+          cache-dependency-path: services/${{ matrix.service }}/pom.xml
+
+      # Python Services
+
       - name: Setup Python
-        if: matrix.service == 'order-service' || matrix.service == 'shipping-service'
+        if: |
+          matrix.service == 'order-service' ||
+          matrix.service == 'shipping-service'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+
+      # Ruby Service
+
       - name: Setup Ruby
         if: matrix.service == 'payment-service'
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: ${{ env.RUBY_VERSION }}
+          working-directory: services/${{ matrix.service }}
           bundler-cache: true
+
+      # .NET Service
+
       - name: Setup .NET
         if: matrix.service == 'inventory-service'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0'
-      - name: Install deps & test
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Build and Test
+
+      - name: Install Dependencies, Build & Test
+        env:
+          SERVICE: ${{ matrix.service }}
+          CI: "true"
         run: |
-          case "${{ matrix.service }}" in
+          set -euo pipefail
+
+          case "$SERVICE" in
+
             frontend|cart-service|api-gateway|load-generator)
-              cd services/${{ matrix.service }} && npm ci && npm test || true ;;
+              npm ci
+              npm run format:check --if-present
+              npm run lint --if-present
+              npm run build --if-present
+              npm test
+              ;;
+
             catalog-service)
-              cd services/${{ matrix.service }} && mvn -B verify ;;
+              mvn -B -ntp clean verify
+              ;;
+
             order-service|shipping-service)
-              cd services/${{ matrix.service }} && pip install -r requirements.txt && python -m pytest || true ;;
+              python -m pip install -r requirements.txt
+
+              if [[ -f requirements-dev.txt ]]; then
+                python -m pip install -r requirements-dev.txt
+              fi
+
+              python -m compileall -q .
+              python -m pytest \
+                --junitxml=test-results.xml
+              ;;
+
             payment-service)
-              cd services/${{ matrix.service }} && bundle install && bundle exec rspec || true ;;
+              bundle check
+              bundle exec rspec
+              ;;
+
             inventory-service)
-              cd services/${{ matrix.service }} && dotnet restore && dotnet test ;;
+              dotnet restore
+              dotnet build \
+                --configuration Release \
+                --no-restore
+
+              dotnet test \
+                --configuration Release \
+                --no-build \
+                --logger "trx"
+              ;;
+
+            *)
+              echo "::error::Unsupported service: $SERVICE"
+              exit 1
+              ;;
+
           esac
-      - name: Upload test results
+
+      - name: Upload Test Reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-${{ matrix.service }}
-          path: services/${{ matrix.service }}/**/test-results.xml
+          name: test-results-${{ matrix.service }}
+          path: |
+            services/${{ matrix.service }}/**/test-results.xml
+            services/${{ matrix.service }}/**/junit.xml
+            services/${{ matrix.service }}/**/surefire-reports/*.xml
+            services/${{ matrix.service }}/**/failsafe-reports/*.xml
+            services/${{ matrix.service }}/**/TestResults/*.trx
+            services/${{ matrix.service }}/coverage/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ============================================================
+  # 3. STATIC APPLICATION SECURITY TESTING
+  # ============================================================
 
   semgrep:
-    needs: discover
+    name: SAST - Semgrep
     runs-on: ubuntu-latest
-    container: returntocorp/semgrep:latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write
+
+    container:
+      image: semgrep/semgrep:1.100.0
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Run Semgrep
-        run: semgrep ci --config=auto --sarif --output=semgrep-results.sarif || true
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Semgrep Security Scan
+        run: |
+          semgrep scan \
+            --config=p/security-audit \
+            --config=p/owasp-top-ten \
+            --error \
+            --sarif \
+            --output=semgrep-results.sarif \
+            services/
+
+      - name: Upload Semgrep Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-security-report
+          path: semgrep-results.sarif
+          retention-days: 30
+
       - name: Upload Semgrep SARIF
+        if: |
+          always() &&
+          hashFiles('semgrep-results.sarif') != '' &&
+          vars.ENABLE_CODE_SCANNING == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep-results.sarif
           category: semgrep
 
-  hadolint:
-    needs: discover
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Hadolint on all Dockerfiles
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: "**/Dockerfile"
-          recursive: true
-          failure-threshold: warning
-          format: sarif
-          output-file: hadolint-results.sarif || true
-      - name: Upload Hadolint SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: hadolint-results.sarif
-          category: hadolint
+  # ============================================================
+  # 4. SECRET DETECTION
+  # ============================================================
 
-  trivy:
-    needs: discover
+  secrets-scan:
+    name: Secret Detection - Gitleaks
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          format: sarif
-          output: trivy-results.sarif
-      - name: Upload Trivy SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy
+    timeout-minutes: 10
 
-  gitleaks:
-    needs: discover
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ============================================================
+  # 5. DEPENDENCY AND CONFIGURATION SECURITY
+  # ============================================================
 
   security:
-    needs: discover
+    name: SCA & Configuration - Trivy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Trivy image scan (placeholder)
-        run: echo "Image scanning runs in containers job"
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          format: sarif
+          output: trivy-filesystem.sarif
+          exit-code: "1"
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-filesystem-report
+          path: trivy-filesystem.sarif
+          retention-days: 30
+
+      - name: Upload Trivy SARIF
+        if: |
+          always() &&
+          hashFiles('trivy-filesystem.sarif') != '' &&
+          vars.ENABLE_CODE_SCANNING == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-filesystem.sarif
+          category: trivy-filesystem
+
+  # ============================================================
+  # 6. CONTAINER BUILD, SCAN, SBOM AND PUBLISH
+  # ============================================================
 
   containers:
-    needs: [discover, validate, security]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    name: Container Security - ${{ matrix.service }}
+
+    needs:
+      - discover
+      - validate
+      - semgrep
+      - secrets-scan
+      - security
+
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      security-events: write
+
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+
+    env:
+      LOCAL_IMAGE: music-store-${{ matrix.service }}:${{ github.sha }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
-      - name: Build & push
+          persist-credentials: false
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Container Image
         uses: docker/build-push-action@v6
         with:
           context: services/${{ matrix.service }}
-          push: true
-          tags: |
-            ${{ env.DOCKERHUB_USERNAME }}/music-store-${{ matrix.service }}:latest
-            ${{ env.DOCKERHUB_USERNAME }}/music-store-${{ matrix.service }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@master
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Scan Container Image
+        uses: aquasecurity/trivy-action@0.30.0
         with:
-          image-ref: ${{ env.DOCKERHUB_USERNAME }}/music-store-${{ matrix.service }}:latest
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
           format: sarif
           output: image-${{ matrix.service }}.sarif
-      - name: Upload image SARIF
+          exit-code: "1"
+
+      - name: Upload Container Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-security-${{ matrix.service }}
+          path: image-${{ matrix.service }}.sarif
+          retention-days: 30
+
+      - name: Upload Container SARIF
+        if: |
+          always() &&
+          hashFiles(format('image-{0}.sarif', matrix.service)) != '' &&
+          vars.ENABLE_CODE_SCANNING == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: image-${{ matrix.service }}.sarif
+          category: image-${{ matrix.service }}
 
-  slack-notification:
-    needs: [validate, security, containers]
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: cyclonedx
+          output: sbom-${{ matrix.service }}.json
+          exit-code: "0"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.json
+          retention-days: 30
+
+      - name: Login to Docker Hub
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish Verified Container Image
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="${REGISTRY}/${DOCKERHUB_USERNAME}/${IMAGE_PREFIX}-${SERVICE}"
+
+          docker tag "$LOCAL_IMAGE" "$IMAGE:$GITHUB_SHA"
+          docker tag "$LOCAL_IMAGE" "$IMAGE:latest"
+
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+          echo "### Published Container Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`$IMAGE:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Security scan: Passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SBOM: Generated" >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 7. MANDATORY CI QUALITY GATE
+  # ============================================================
+
+  quality-gate:
+    name: Enterprise CI Quality Gate
+
+    needs:
+      - discover
+      - validate
+      - semgrep
+      - secrets-scan
+      - security
+      - containers
+
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
-      - name: Notify Slack
-        if: env.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26.0
-        with:
-          payload: |
-            {
-              "text": "CI completed for ${{ github.repository }}",
-              "blocks": [
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*${{ github.repository }}* | ${{ github.ref_name }} | ${{ github.actor }}"}}
-              ]
-            }
+      - name: Evaluate Pipeline Status
         env:
-          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Enterprise DevSecOps CI Summary"
+            echo ""
+            echo "| Stage | Status |"
+            echo "|---|---|"
+
+            echo "$JOB_RESULTS" | jq -r '
+              to_entries[] |
+              "| \(.key) | \(.value.result) |"
+            '
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if echo "$JOB_RESULTS" | jq -e \
+            'all(.[]; .result == "success")' > /dev/null; then
+            echo "All mandatory quality gates passed."
+          else
+            echo "::error::One or more mandatory CI checks failed"
+            exit 1
+          fi
+
+  # ============================================================
+  # 8. SLACK NOTIFICATION
+  # ============================================================
+
+  slack-notification:
+    name: Slack Pipeline Notification
+
+    needs:
+      - discover
+      - validate
+      - semgrep
+      - secrets-scan
+      - security
+      - containers
+      - quality-gate
+
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send Slack Notification
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PIPELINE_STATUS: ${{ needs.quality-gate.result }}
+          VALIDATE_STATUS: ${{ needs.validate.result }}
+          SAST_STATUS: ${{ needs.semgrep.result }}
+          SECRETS_STATUS: ${{ needs.secrets-scan.result }}
+          SECURITY_STATUS: ${{ needs.security.result }}
+          CONTAINER_STATUS: ${{ needs.containers.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            echo "Slack webhook not configured. Skipping notification."
+            exit 0
+          fi
+
+          case "$PIPELINE_STATUS" in
+            success)
+              COLOR="#2EB67D"
+              STATUS="SUCCESS"
+              ICON=":white_check_mark:"
+              ;;
+            cancelled)
+              COLOR="#ECB22E"
+              STATUS="CANCELLED"
+              ICON=":warning:"
+              ;;
+            *)
+              COLOR="#E01E5A"
+              STATUS="FAILED"
+              ICON=":x:"
+              ;;
+          esac
+
+          PAYLOAD=$(jq -n \
+            --arg color "$COLOR" \
+            --arg status "$STATUS" \
+            --arg icon "$ICON" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg commit "${GITHUB_SHA:0:7}" \
+            --arg build "$VALIDATE_STATUS" \
+            --arg sast "$SAST_STATUS" \
+            --arg secrets "$SECRETS_STATUS" \
+            --arg security "$SECURITY_STATUS" \
+            --arg containers "$CONTAINER_STATUS" \
+            --arg url "$RUN_URL" \
+            '{
+              text: "\($icon) Enterprise DevSecOps CI: \($status)",
+              attachments: [{
+                color: $color,
+                blocks: [
+                  {
+                    type: "header",
+                    text: {
+                      type: "plain_text",
+                      text: "Enterprise DevSecOps CI - \($status)"
+                    }
+                  },
+                  {
+                    type: "section",
+                    fields: [
+                      {type: "mrkdwn", text: "*Repository:*\n\($repo)"},
+                      {type: "mrkdwn", text: "*Branch:*\n\($branch)"},
+                      {type: "mrkdwn", text: "*Triggered By:*\n\($actor)"},
+                      {type: "mrkdwn", text: "*Commit:*\n\($commit)"}
+                    ]
+                  },
+                  {type: "divider"},
+                  {
+                    type: "section",
+                    text: {
+                      type: "mrkdwn",
+                      text: "*Pipeline Results*\n• Build & Test: \($build)\n• SAST: \($sast)\n• Secret Detection: \($secrets)\n• SCA & Configuration: \($security)\n• Container Security: \($containers)"
+                    }
+                  },
+                  {
+                    type: "actions",
+                    elements: [{
+                      type: "button",
+                      text: {
+                        type: "plain_text",
+                        text: "View Pipeline"
+                      },
+                      url: $url
+                    }]
+                  }
+                ]
+              }]
+            }')
+
+          curl --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --max-time 30 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL"
