@@ -102,6 +102,20 @@ jobs:
 
       # Node.js Services
 
+      - name: Check for package-lock.json
+        if: |
+          contains(
+            fromJSON('["frontend","cart-service","api-gateway","load-generator"]'),
+            matrix.service
+          )
+        id: node-lockfile
+        run: |
+          if [[ -f package-lock.json ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Node.js
         if: |
           contains(
@@ -111,8 +125,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+          cache: ${{ steps.node-lockfile.outputs.exists == 'true' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.node-lockfile.outputs.exists == 'true' && 'package-lock.json' || '' }}
 
       # Java Service
 
