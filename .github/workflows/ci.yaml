@@ -110,24 +110,21 @@ jobs:
   security:
     needs: discover
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
-      - name: Trivy FS
+      - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           format: sarif
-          output: trivy-${{ matrix.service }}.sarif
-      - name: Upload SARIF
+          output: trivy-results.sarif
+      - name: Upload Trivy SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: trivy-${{ matrix.service }}.sarif
-          category: trivy-${{ matrix.service }}
+          sarif_file: trivy-results.sarif
+          category: trivy
 
   containers:
     needs: [discover, validate, security]
