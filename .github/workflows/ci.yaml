@@ -185,7 +185,7 @@ jobs:
               npm run format:check --if-present
               npm run lint --if-present
               npm run build --if-present
-              npm test
+              npm test --if-present
               ;;
 
             catalog-service)
@@ -200,8 +200,15 @@ jobs:
               fi
 
               python -m compileall -q .
-              python -m pytest \
-                --junitxml=test-results.xml
+              # pytest exits with 5 when no tests are collected; treat that as
+              # "no suite yet" instead of a failure.
+              set +e
+              python -m pytest --junitxml=test-results.xml
+              rc=$?
+              set -e
+              if [[ $rc -ne 0 && $rc -ne 5 ]]; then
+                exit $rc
+              fi
               ;;
 
             payment-service)
@@ -215,10 +222,14 @@ jobs:
                 --configuration Release \
                 --no-restore
 
-              dotnet test \
-                --configuration Release \
-                --no-build \
-                --logger "trx"
+              if [[ -n "$(grep -rl --include='*.csproj' 'Microsoft.NET.Test.Sdk' . || true)" ]]; then
+                dotnet test \
+                  --configuration Release \
+                  --no-build \
+                  --logger "trx"
+              else
+                echo "No test project found (no Microsoft.NET.Test.Sdk reference); skipping dotnet test."
+              fi
               ;;
 
             *)
@@ -283,7 +294,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Semgrep SARIF
-        if: always()
+        if: always() && hashFiles('semgrep-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep-results.sarif
@@ -330,7 +341,7 @@ jobs:
           persist-credentials: false
 
       - name: Run Trivy Filesystem Scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: fs
           scan-ref: .
@@ -338,6 +349,18 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: false
           format: table
+          exit-code: "0"
+
+      - name: Run Trivy Filesystem Scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          format: sarif
+          output: trivy-filesystem.sarif
           exit-code: "0"
 
       - name: Upload Security Report
@@ -349,7 +372,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Trivy SARIF
-        if: always()
+        if: always() && hashFiles('trivy-filesystem.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-filesystem.sarif
@@ -405,7 +428,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
       - name: Scan Container Image
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.LOCAL_IMAGE }}
           scanners: vuln
@@ -434,7 +457,7 @@ jobs:
           category: image-${{ matrix.service }}
 
       - name: Generate CycloneDX SBOM
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.LOCAL_IMAGE }}
           format: cyclonedx
