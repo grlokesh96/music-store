@@ -126,6 +126,23 @@ jobs:
           sarif_file: hadolint-results.sarif
           category: hadolint
 
+  trivy:
+    needs: discover
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-results.sarif
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
   gitleaks:
     needs: discover
     runs-on: ubuntu-latest
@@ -143,17 +160,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          format: sarif
-          output: trivy-results.sarif
-      - name: Upload Trivy SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy
+      - name: Trivy image scan (placeholder)
+        run: echo "Image scanning runs in containers job"
 
   containers:
     needs: [discover, validate, security]
