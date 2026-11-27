@@ -277,6 +277,8 @@ jobs:
           persist-credentials: false
 
       - name: Run Semgrep Security Scan
+        # NOTE: "|| true" makes this scan report-only. Remove it once findings
+        # are triaged to make SAST findings block the pipeline.
         run: |
           semgrep scan \
             --config=p/security-audit \
@@ -501,8 +503,8 @@ jobs:
 
           echo "### Published Container Image" >> "$GITHUB_STEP_SUMMARY"
           echo "- Image: \`$IMAGE:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Security scan: Passed" >> "$GITHUB_STEP_SUMMARY"
-          echo "- SBOM: Generated" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image scan: completed, findings in the Security tab (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SBOM: artifact sbom-${SERVICE}" >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================
   # 7. MANDATORY CI QUALITY GATE
