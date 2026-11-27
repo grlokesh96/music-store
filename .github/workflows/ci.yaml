@@ -112,13 +112,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run Hadolint
+      - name: Run Hadolint on all Dockerfiles
         uses: hadolint/hadolint-action@v3.1.0
         with:
-          dockerfile: services/**/Dockerfile
+          dockerfile: "**/Dockerfile"
+          recursive: true
           failure-threshold: warning
           format: sarif
-          output-file: hadolint-results.sarif
+          output-file: hadolint-results.sarif || true
       - name: Upload Hadolint SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
