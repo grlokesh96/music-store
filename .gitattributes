@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.java text
+*.js text
+*.py text
+*.rb text
+*.cs text
+*.yaml text
+*.yml text
+*.md text
+package-lock.json linguist-generated=true
