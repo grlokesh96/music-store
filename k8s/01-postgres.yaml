@@ -18,7 +18,7 @@ metadata:
     app.kubernetes.io/name: postgres
     app.kubernetes.io/part-of: music-store
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels: { app.kubernetes.io/name: postgres }
   template:
